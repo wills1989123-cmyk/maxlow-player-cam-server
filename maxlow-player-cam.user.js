@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name        Maxlow Player Cam
+// @name         Maxlow Player Cam
 // @namespace    maxlow-designs
-// @version      0.7.4
-// @description Maxlow Designs two-way online Player Cam for Autodarts
+// @version      0.7.5
+// @description  Universal Maxlow Player Cam: unique two-way online pairing
 // @match        https://play.autodarts.com/*
 // @grant        none
 // ==/UserScript==
@@ -1425,11 +1425,19 @@
         const isMyTurn = !!myUserId && activeUserId === myUserId;
 
         if (isMyTurn) {
-            wrapper.style.display = 'none';
+            // v0.7.5: show our own local camera on our screen while we throw.
+            // The same local stream continues to be sent to the opponent.
+            if (cameraStream && video.srcObject !== cameraStream) {
+                video.srcObject = cameraStream;
+            }
+
+            video.muted = true;
+            wrapper.style.display = cameraEnabled ? 'block' : 'none';
+            video.play().catch(() => {});
 
             if (lastTurnState !== true) {
                 console.log(
-                    'MAXLOW: MY TURN - opponent camera hidden',
+                    'MAXLOW: MY TURN - local camera shown on both screens',
                     state?.activePlayer?.name
                 );
                 lastTurnState = true;
