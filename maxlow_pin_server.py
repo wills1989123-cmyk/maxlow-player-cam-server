@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+import os
 from aiohttp import web
 
 # Maxlow Designs - Player Cam PIN Signalling Server
@@ -222,5 +223,5 @@ if __name__ == "__main__":
     web.run_app(
         app,
         host="0.0.0.0",
-        port=8000
+    port=int(os.environ.get("PORT", 8000))
     )
