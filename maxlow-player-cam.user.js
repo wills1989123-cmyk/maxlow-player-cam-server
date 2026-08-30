@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Maxlow Universal Player Cam
+// @name        Maxlow Player Cam
 // @namespace    maxlow-designs
 // @version      0.7.4
-// @description  Universal Maxlow Player Cam: unique two-way online pairing
+// @description Maxlow Designs two-way online Player Cam for Autodarts
 // @match        https://play.autodarts.com/*
 // @grant        none
 // ==/UserScript==
