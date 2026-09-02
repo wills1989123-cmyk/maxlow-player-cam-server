@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Maxlow Player Cam
 // @namespace    maxlow-designs
-// @version      0.7.5
-// @description  Universal Maxlow Player Cam: unique two-way online pairing
+// @version      0.9.18
+// @description  Maxlow Player Cam: player cam + board cam + live audio + peer-to-peer chat
 // @match        https://play.autodarts.com/*
 // @grant        none
 // ==/UserScript==
@@ -10,13 +10,26 @@
 (function () {
     'use strict';
 
-    const CAMERA_ID = 'maxlow-live-player-cam';
+    
+    const maxlowPinBroadcastCss = '\n/* ===== MAXLOW v0.8.2 — PIN INPUT BROADCAST STYLE ===== */\n#maxlow-pin-input-button,\n#maxlow-pin-input-btn,\nbutton[data-maxlow-pin-input],\n.maxlow-pin-input-button {\n    background: linear-gradient(90deg, #1558b0 0 50%, #d71920 50% 100%) !important;\n    color: #fff !important;\n    border: 1px solid rgba(255,255,255,.65) !important;\n    border-radius: 3px !important;\n    box-shadow: 0 0 10px rgba(34,137,255,.35), 0 0 10px rgba(255,45,45,.25) !important;\n    font-weight: 900 !important;\n    letter-spacing: .4px !important;\n}\n\n/* Sender / PIN panel: dark broadcast card with Maxlow blue/red trim */\n#maxlow-sender-overlay,\n#maxlow-pin-overlay,\n.maxlow-sender-overlay,\n.maxlow-pin-overlay {\n    background: rgba(6,10,18,.97) !important;\n    border: 1px solid #2388ff !important;\n    border-radius: 7px !important;\n    box-shadow: 0 0 0 1px rgba(230,30,35,.55), 0 0 20px rgba(0,0,0,.7) !important;\n}\n\n/* Any obvious PIN heading inside the sender panel */\n#maxlow-sender-overlay h1,\n#maxlow-sender-overlay h2,\n#maxlow-sender-overlay h3,\n#maxlow-pin-overlay h1,\n#maxlow-pin-overlay h2,\n#maxlow-pin-overlay h3 {\n    color: #fff !important;\n    text-transform: uppercase !important;\n    letter-spacing: .7px !important;\n}\n\n/* Reusable Maxlow Designs badge used by the script */\n.maxlow-pin-brand {\n    display:flex;\n    align-items:center;\n    width:max-content;\n    overflow:hidden;\n    border-radius:2px;\n    font-family:Arial,Helvetica,sans-serif;\n    font-size:12px;\n    line-height:20px;\n    font-weight:900;\n    color:#fff;\n    box-shadow:0 0 8px rgba(0,0,0,.5);\n}\n.maxlow-pin-brand .maxlow-blue { background:#1558b0; padding:0 7px; }\n.maxlow-pin-brand .maxlow-red  { background:#d71920; padding:0 7px; }\n';
+    try {
+        if (typeof GM_addStyle === 'function') GM_addStyle(maxlowPinBroadcastCss);
+        else {
+            const s = document.createElement('style');
+            s.textContent = maxlowPinBroadcastCss;
+            document.documentElement.appendChild(s);
+        }
+    } catch (e) { console.warn('MAXLOW: PIN style injection failed', e); }
+const CAMERA_ID = 'maxlow-live-player-cam';
     const WRAPPER_ID = 'maxlow-live-player-cam-wrapper';
     const BUTTON_ID = 'maxlow-live-cam-button';
     const SETTINGS_ID = 'maxlow-live-cam-settings-button';
     const PANEL_ID = 'maxlow-live-cam-panel';
+    const BOARD_CAMERA_ID = 'maxlow-live-board-cam';
+    const BOARD_WRAPPER_ID = 'maxlow-live-board-cam-wrapper';
 
     let cameraStream = null;
+    let boardCameraStream = null;
     let cameraEnabled = true;
 
     // ONLINE MODE - public Maxlow signalling server
@@ -24,6 +37,13 @@
     let onlineSocket = null;
     let onlinePeer = null;
     let remoteStream = null;
+    let remoteBoardStream = null;
+    let remoteVideoTrackCount = 0;
+    let microphoneStream = null;
+    let remoteAudioStream = null;
+    let onlineChatChannel = null;
+    const maxlowChatHistory = [];
+    let endedMatchId = '';
     let pendingIce = [];
     let onlineIdentity = null;
     let onlinePairingPin = '';
@@ -35,6 +55,10 @@
 
     const defaults = {
         deviceId: '',
+        boardCameraEnabled: false,
+        boardDeviceId: '',
+        audioEnabled: false,
+        audioDeviceId: '',
         size: 'medium',
         position: 'bottom-right',
         mode: 'local'
@@ -61,6 +85,177 @@
             JSON.stringify(settings)
         );
     }
+
+    // ============================================================
+    // MAXLOW LIVE CHAT
+    // ============================================================
+    function setChatChannel(channel) {
+        onlineChatChannel = channel || null;
+        window.__maxlowChatChannel = channel || null;
+        if (!channel) return;
+
+        channel.onopen = () => {
+            console.log('MAXLOW: CHAT CONNECTED');
+            const s = document.getElementById('maxlow-chat-status');
+            if (s) s.textContent = 'LIVE';
+        };
+        channel.onclose = () => {
+            const s = document.getElementById('maxlow-chat-status');
+            if (s) s.textContent = 'OFFLINE';
+        };
+        channel.onmessage = event => {
+            const packet = parseMaxlowChatPacket(String(event.data || ''));
+            addChatMessage(packet.message, false, packet.username);
+        };
+    }
+
+
+    function getMaxlowChatUsername() {
+        try {
+            const state = findMatchState?.();
+            const userId = state?.userId;
+
+            const players =
+                state?.gameClient?.players ||
+                state?.players ||
+                [];
+
+            const list = Array.isArray(players)
+                ? players
+                : Object.values(players || {});
+
+            const me = list.find(player =>
+                String(
+                    player?.userId ??
+                    player?.id ??
+                    player?.uid ??
+                    ''
+                ) === String(userId ?? '')
+            );
+
+            return String(
+                me?.username ??
+                me?.userName ??
+                me?.name ??
+                me?.displayName ??
+                me?.nickname ??
+                userId ??
+                'PLAYER'
+            ).trim();
+        } catch {
+            return 'PLAYER';
+        }
+    }
+
+    function parseMaxlowChatPacket(raw) {
+        try {
+            const parsed = JSON.parse(raw);
+            if (parsed?.type === 'maxlow-chat' && typeof parsed.message === 'string') {
+                return {
+                    username: String(parsed.username || 'PLAYER'),
+                    message: parsed.message
+                };
+            }
+        } catch {}
+        return { username: 'PLAYER', message: String(raw || '') };
+    }
+
+    function renderChatMessage(message, mine, username = 'PLAYER') {
+        const list = document.getElementById('maxlow-chat-messages');
+        if (!list) return;
+        const row = document.createElement('div');
+        row.style.cssText = `margin:6px 0;padding:8px 10px;border-radius:4px;max-width:85%;word-break:break-word;
+            ${mine ? 'margin-left:auto;background:#1558b0;' : 'margin-right:auto;background:#202938;'}`;
+        row.textContent = `${username}: ${message}`;
+        list.appendChild(row);
+        list.scrollTop = list.scrollHeight;
+    }
+
+    function addChatMessage(message, mine, username = 'PLAYER') {
+        if (!message) return;
+
+        maxlowChatHistory.push({ message, mine: !!mine, username });
+        if (maxlowChatHistory.length > 100) maxlowChatHistory.shift();
+
+        const list = document.getElementById('maxlow-chat-messages');
+        if (list) {
+            renderChatMessage(message, mine, username);
+        } else if (!mine) {
+            const btn = document.getElementById('maxlow-chat-button');
+            if (btn) {
+                const count = Number(btn.dataset.unread || 0) + 1;
+                btn.dataset.unread = String(count);
+                btn.textContent = `CHAT • ${count}`;
+            }
+        }
+    }
+
+    window.maxlowSetChatChannel = setChatChannel;
+    window.maxlowChatReceive = raw => {
+        const packet = parseMaxlowChatPacket(String(raw || ''));
+        addChatMessage(packet.message, false, packet.username);
+    };
+
+    window.maxlowOpenChat = function () {
+        let panel = document.getElementById('maxlow-chat-panel');
+        if (panel) {
+            panel.remove();
+            return;
+        }
+
+        const btn = document.getElementById('maxlow-chat-button');
+        if (btn) {
+            btn.dataset.unread = '0';
+            btn.textContent = 'CHAT';
+        }
+
+        panel = document.createElement('div');
+        panel.id = 'maxlow-chat-panel';
+        panel.style.cssText = 'position:fixed;right:12px;top:52px;width:min(92vw,360px);height:430px;z-index:2147483646;background:#070b12;color:#fff;border:1px solid #2388ff;box-shadow:0 0 0 1px rgba(215,25,32,.65),0 12px 40px rgba(0,0,0,.7);font-family:Arial,sans-serif;padding:12px;border-radius:5px;display:flex;flex-direction:column;';
+
+        panel.innerHTML = `
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+                <div style="display:flex;font-weight:900">
+                    <span style="background:#1558b0;padding:4px 8px">Maxlow</span>
+                    <span style="background:#d71920;padding:4px 8px">Designs</span>
+                </div>
+                <div id="maxlow-chat-status" style="font-size:10px;color:#9fb4cc;font-weight:900">${window.__maxlowChatChannel?.readyState === 'open' ? 'LIVE' : 'OFFLINE'}</div>
+            </div>
+            <div style="font-size:11px;font-weight:900;letter-spacing:1.4px;margin-bottom:8px">PLAYER CHAT</div>
+            <div id="maxlow-chat-messages" style="flex:1;overflow:auto;background:#02050a;border:1px solid #223247;padding:8px;border-radius:3px"></div>
+            <div style="display:flex;gap:6px;margin-top:8px">
+                <input id="maxlow-chat-input" maxlength="300" placeholder="Type a message..." style="flex:1;background:#030712;color:#fff;border:1px solid #315b87;border-radius:3px;padding:10px;outline:none">
+                <button id="maxlow-chat-send" style="background:#d71920;color:#fff;border:1px solid rgba(255,255,255,.25);border-radius:3px;padding:0 14px;font-weight:900;cursor:pointer">SEND</button>
+            </div>`;
+
+        document.body.appendChild(panel);
+
+        // Repaint messages received/sent earlier in this match/session.
+        maxlowChatHistory.forEach(item => renderChatMessage(item.message, item.mine, item.username));
+
+        const input = document.getElementById('maxlow-chat-input');
+        const sendButton = document.getElementById('maxlow-chat-send');
+
+        const sendMessage = () => {
+            const message = input.value.trim();
+            const channel = window.__maxlowChatChannel;
+            if (!message || !channel || channel.readyState !== 'open') return;
+            const username = getMaxlowChatUsername();
+            channel.send(JSON.stringify({
+                type: 'maxlow-chat',
+                username,
+                message
+            }));
+            addChatMessage(message, true, username);
+            input.value = '';
+            input.focus();
+        };
+        sendButton.onclick = sendMessage;
+        input.addEventListener('keydown', e => {
+            if (e.key === 'Enter') sendMessage();
+        });
+        input.focus();
+    };
 
 
     // ============================================================
@@ -447,7 +642,7 @@
 
 
             <!-- ==================================================
-                 AUTODARTS BOTTOM BADGE
+                 OCHE CAMERA BOTTOM BADGE
             =================================================== -->
 
             <div style="
@@ -501,49 +696,15 @@
                 z-index:10;
             ">
 
-                AUTODARTS
+                BOARD CAMERA
 
             </div>
 
 
             <!-- RED BOTTOM ACCENT -->
 
-            <div style="
-                position:absolute;
-
-                left:37%;
-                bottom:5%;
-
-                width:6%;
-                height:3px;
-
-                background:#ff1717;
-
-                box-shadow:
-                    0 0 7px #ff1717;
-
-                z-index:11;
-            "></div>
-
 
             <!-- BLUE BOTTOM ACCENT -->
-
-            <div style="
-                position:absolute;
-
-                right:37%;
-                bottom:5%;
-
-                width:6%;
-                height:3px;
-
-                background:#168cff;
-
-                box-shadow:
-                    0 0 7px #168cff;
-
-                z-index:11;
-            "></div>
 
         `;
 
@@ -554,6 +715,213 @@
         return video;
     }
 
+
+
+    // ============================================================
+    // BOARD CAMERA (picture-in-picture)
+    // ============================================================
+
+    function createBoardCamera() {
+        let boardWrapper = document.getElementById(BOARD_WRAPPER_ID);
+        if (boardWrapper) return document.getElementById(BOARD_CAMERA_ID);
+
+        boardWrapper = document.createElement('div');
+        boardWrapper.id = BOARD_WRAPPER_ID;
+        Object.assign(boardWrapper.style, {
+            position: 'fixed',
+            zIndex: '999998',
+            boxSizing: 'border-box',
+            fontFamily: 'Arial, Helvetica, sans-serif',
+            overflow: 'visible',
+            display: 'none'
+        });
+
+        const viewport = document.createElement('div');
+        Object.assign(viewport.style, {
+            position: 'absolute', left: '3%', right: '3%', top: '12%', bottom: '6%',
+            background: '#000', borderLeft: '4px solid #ff1717', borderRight: '4px solid #168cff',
+            borderRadius: '0 0 7px 7px', boxSizing: 'border-box', overflow: 'hidden', zIndex: '1',
+            boxShadow: '-3px 0 10px rgba(255,23,23,.75), 3px 0 10px rgba(22,140,255,.75)'
+        });
+
+        const video = document.createElement('video');
+        video.id = BOARD_CAMERA_ID;
+        video.autoplay = true; video.muted = true; video.playsInline = true;
+        Object.assign(video.style, {
+            position: 'absolute', inset: '0', width: '100%', height: '100%', objectFit: 'cover',
+            display: 'block', margin: '0', padding: '0', border: '0', outline: '0', background: '#000', zIndex: '1'
+        });
+        viewport.appendChild(video);
+
+        const topBorder = document.createElement('div');
+        Object.assign(topBorder.style, {position:'absolute',left:'0',right:'0',top:'0',height:'3px',background:'linear-gradient(90deg,#ff1717 0%,#ff1717 48%,#168cff 52%,#168cff 100%)',zIndex:'3'});
+        const bottomBorder = document.createElement('div');
+        Object.assign(bottomBorder.style, {position:'absolute',left:'0',right:'0',bottom:'0',height:'3px',background:'linear-gradient(90deg,#ff1717 0%,#ff1717 48%,#168cff 52%,#168cff 100%)',zIndex:'3'});
+        viewport.append(topBorder,bottomBorder);
+        boardWrapper.appendChild(viewport);
+
+        const frame = document.createElement('div');
+        Object.assign(frame.style,{position:'absolute',inset:'0',zIndex:'5',pointerEvents:'none'});
+        frame.innerHTML = `
+            <div style="
+                position:absolute;left:3%;right:3%;top:0;height:13%;
+                background:linear-gradient(180deg,#20242b 0%,#07090d 45%,#11151b 100%);
+                border-top:2px solid #9ca5af;border-bottom:2px solid #222;
+                border-left:1px solid #363b43;border-right:1px solid #363b43;
+                border-radius:0;box-sizing:border-box;box-shadow:0 4px 12px rgba(0,0,0,.8);z-index:5;
+            "></div>
+
+            <div style="
+                position:absolute;top:1.5%;left:50%;transform:translateX(-50%);
+                display:flex;height:9%;min-height:22px;
+                border:1px solid rgba(255,255,255,.55);border-radius:4px;overflow:hidden;
+                box-shadow:0 2px 8px rgba(0,0,0,.7);
+                font-family:Arial,Helvetica,sans-serif;font-weight:700;
+                font-size:clamp(11px,2.2vw,28px);line-height:1;white-space:nowrap;z-index:10;
+            ">
+                <div style="display:flex;align-items:center;padding:0 .5em;color:#fff;background:linear-gradient(180deg,#1f59ae,#092a6c);">Maxlow</div>
+                <div style="display:flex;align-items:center;padding:0 .5em;color:#fff;background:linear-gradient(180deg,#ff2c2c,#b50000);">Designs</div>
+            </div>
+
+            <div style="position:absolute;left:5%;top:3%;display:flex;align-items:center;gap:5px;color:#fff;font-weight:900;font-style:italic;font-size:clamp(7px,1.2vw,16px);text-shadow:0 1px 3px #000;z-index:10;">
+                <span style="display:inline-block;width:.7em;height:.7em;border-radius:50%;background:#ff1010;box-shadow:0 0 8px #ff0000;"></span> LIVE
+            </div>
+
+            <div style="position:absolute;right:5%;top:3%;display:flex;align-items:center;gap:5px;color:#fff;font-weight:900;font-style:italic;font-size:clamp(7px,1.2vw,16px);text-shadow:0 1px 3px #000;z-index:10;">
+                LIVE <span style="display:inline-block;width:.7em;height:.7em;border-radius:50%;background:#ff1010;box-shadow:0 0 8px #ff0000;"></span>
+            </div>
+
+            <div style="
+                position:absolute;left:35%;right:35%;bottom:2%;height:8%;min-height:18px;
+                background:linear-gradient(180deg,#15191f,#050609);
+                border:1px solid #69717a;
+                clip-path:polygon(7% 0,93% 0,100% 50%,93% 100%,7% 100%,0 50%);
+                display:flex;justify-content:center;align-items:center;color:#fff;
+                font-size:clamp(6px,1.1vw,14px);font-weight:700;letter-spacing:.22em;
+                text-shadow:0 1px 3px #000;z-index:10;
+            ">OCHE CAMERA</div>
+        `;
+        boardWrapper.appendChild(frame);
+        document.body.appendChild(boardWrapper);
+        applyBoardCameraLayout();
+        return video;
+    }
+
+    function applyBoardCameraLayout() {
+        const boardWrapper = document.getElementById(BOARD_WRAPPER_ID);
+        if (!boardWrapper) return;
+        const sizes = {small:['480px','250px'],medium:['720px','375px'],large:['960px','500px']};
+        const [width,height] = sizes[settings.size] || sizes.medium;
+        boardWrapper.style.width = width;
+        boardWrapper.style.height = height;
+        boardWrapper.style.top='auto'; boardWrapper.style.bottom='auto'; boardWrapper.style.left='auto'; boardWrapper.style.right='auto';
+
+        // Oche cam mirrors the board cam to the opposite side of the screen.
+        switch(settings.position) {
+            case 'bottom-left': boardWrapper.style.right='25px'; boardWrapper.style.bottom='25px'; break;
+            case 'bottom-right': boardWrapper.style.left='25px'; boardWrapper.style.bottom='25px'; break;
+            case 'top-left': boardWrapper.style.right='25px'; boardWrapper.style.top='60px'; break;
+            case 'top-right': boardWrapper.style.left='25px'; boardWrapper.style.top='60px'; break;
+            default: boardWrapper.style.left='25px'; boardWrapper.style.bottom='25px';
+        }
+    }
+
+    function showBoardVideo(stream) {
+        const video = createBoardCamera();
+        const boardWrapper = document.getElementById(BOARD_WRAPPER_ID);
+
+        if (!stream || !boardWrapper) {
+            if (boardWrapper) boardWrapper.style.display = 'none';
+            if (video) video.srcObject = null;
+            return;
+        }
+
+        if (video.srcObject !== stream) video.srcObject = stream;
+        video.muted = true;
+        boardWrapper.style.display = cameraEnabled ? 'block' : 'none';
+        video.play().catch(() => {});
+    }
+
+    async function startBoardCamera() {
+        if (!settings.boardCameraEnabled) {
+            if (boardCameraStream) {
+                boardCameraStream.getTracks().forEach(track => track.stop());
+                boardCameraStream = null;
+            }
+            showBoardVideo(null);
+            return;
+        }
+
+        try {
+            if (boardCameraStream) {
+                boardCameraStream.getTracks().forEach(track => track.stop());
+                boardCameraStream = null;
+            }
+
+            const constraints = settings.boardDeviceId
+                ? {
+                    deviceId: { exact: settings.boardDeviceId },
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                }
+                : {
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                };
+
+            boardCameraStream = await navigator.mediaDevices.getUserMedia({
+                video: constraints,
+                audio: false
+            });
+
+            if (settings.mode === 'local') showBoardVideo(boardCameraStream);
+            console.log('MAXLOW: BOARD CAMERA READY');
+        } catch (error) {
+            console.error('MAXLOW: Board camera error', error);
+            boardCameraStream = null;
+            showBoardVideo(null);
+        }
+    }
+
+
+    async function startMicrophone() {
+        if (!settings.audioEnabled) {
+            try { microphoneStream?.getTracks().forEach(t => t.stop()); } catch {}
+            microphoneStream = null;
+            return;
+        }
+
+        try {
+            try { microphoneStream?.getTracks().forEach(t => t.stop()); } catch {}
+            const audioConstraints = settings.audioDeviceId
+                ? { deviceId: { exact: settings.audioDeviceId }, echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+                : { echoCancellation:true, noiseSuppression:true, autoGainControl:true };
+
+            microphoneStream = await navigator.mediaDevices.getUserMedia({
+                video:false,
+                audio:audioConstraints
+            });
+            console.log('MAXLOW: MICROPHONE READY');
+        } catch (error) {
+            console.error('MAXLOW: Microphone error', error);
+            microphoneStream = null;
+        }
+    }
+
+    function playRemoteAudio(stream) {
+        if (!stream) return;
+        let audio = document.getElementById('maxlow-remote-audio');
+        if (!audio) {
+            audio = document.createElement('audio');
+            audio.id = 'maxlow-remote-audio';
+            audio.autoplay = true;
+            audio.playsInline = true;
+            document.body.appendChild(audio);
+        }
+        audio.srcObject = stream;
+        audio.volume = 1;
+        audio.play().catch(() => console.warn('MAXLOW: click page once to allow opponent audio'));
+    }
 
     // ============================================================
     // START CAMERA
@@ -633,14 +1001,18 @@
 
             populateCameraList();
 
+            if (settings.boardCameraEnabled && !boardCameraStream) {
+                await startBoardCamera();
+            }
+
             console.log(
-                'MAXLOW UNIVERSAL PLAYER CAM v0.7.4'
+                'MAXLOW UNIVERSAL PLAYER CAM v0.8.1'
             );
 
         } catch (error) {
 
             console.error(
-                'MAXLOW LIVE PLAYER CAM: Camera error',
+                'MAXLOW LIVE CAMERA SYSTEM: Camera error',
                 error
             );
         }
@@ -716,6 +1088,9 @@
         wrapper.style.width = width;
         wrapper.style.height = height;
 
+        // Keep optional board cam the same size, on the opposite side.
+        if (document.getElementById(BOARD_WRAPPER_ID)) applyBoardCameraLayout();
+
         wrapper.style.top = 'auto';
         wrapper.style.bottom = 'auto';
         wrapper.style.left = 'auto';
@@ -742,7 +1117,7 @@
 
             case 'top-right':
 
-                wrapper.style.right = '25px';
+                wrapper.style.right = '35px';
                 wrapper.style.top = '60px';
 
                 break;
@@ -750,7 +1125,7 @@
 
             default:
 
-                wrapper.style.right = '25px';
+                wrapper.style.right = '35px';
                 wrapper.style.bottom = '25px';
         }
     }
@@ -882,12 +1257,16 @@
             settingsButton.id = SETTINGS_ID;
             settingsButton.type = 'button';
 
-            settingsButton.textContent = '⚙';
+            settingsButton.textContent = '⚙ MAXLOW';
 
             styleToolbarButton(settingsButton);
 
-            settingsButton.style.padding =
-                '0 8px';
+            settingsButton.title = 'Maxlow Camera Settings';
+            settingsButton.style.padding = '0 10px';
+            settingsButton.style.fontSize = '11px';
+            settingsButton.style.fontWeight = '900';
+            settingsButton.style.whiteSpace = 'nowrap';
+            settingsButton.style.minWidth = '78px';
 
 
             settingsButton.addEventListener(
@@ -1014,8 +1393,8 @@
             </div>
 
 
-            <label style="font-size:12px;">
-                CAMERA
+            <label style="font-size:12px;font-weight:800;">
+                BOARD CAMERA
             </label>
 
 
@@ -1030,8 +1409,37 @@
 
             </select>
 
+            <label style="
+                display:flex;align-items:center;gap:8px;
+                font-size:12px;margin:2px 0 8px;
+            ">
+                <input id="maxlow-board-enabled" type="checkbox">
+                OCHE CAMERA
+            </label>
 
-            <label style="font-size:12px;">
+            <select
+                id="maxlow-board-camera-select"
+                style="${selectStyle()}"
+            >
+                <option value="">Default / second camera</option>
+            </select>
+
+
+            <label style="
+                display:flex;align-items:center;gap:8px;
+                font-size:12px;margin:2px 0 8px;
+            ">
+                <input id="maxlow-audio-enabled" type="checkbox">
+                LIVE AUDIO
+            </label>
+
+            <select
+                id="maxlow-audio-select"
+                style="${selectStyle()}"
+            >
+                <option value="">Default microphone</option>
+            </select>
+<label style="font-size:12px;">
                 SIZE
             </label>
 
@@ -1137,7 +1545,21 @@
         document.body.appendChild(panel);
 
 
-        const sizeSelect =
+        const cameraSelect =
+            document.getElementById('maxlow-camera-select');
+
+        const boardEnabled =
+            document.getElementById('maxlow-board-enabled');
+
+        const boardSelect =
+            document.getElementById('maxlow-board-camera-select');
+
+        const audioEnabled =
+            document.getElementById('maxlow-audio-enabled');
+
+        const audioSelect =
+            document.getElementById('maxlow-audio-select');
+const sizeSelect =
             document.getElementById(
                 'maxlow-size-select'
             );
@@ -1155,7 +1577,38 @@
             );
 
 
-        sizeSelect.value =
+        boardEnabled.checked = !!settings.boardCameraEnabled;
+        boardSelect.disabled = !settings.boardCameraEnabled;
+        boardSelect.style.opacity = settings.boardCameraEnabled ? '1' : '.45';
+
+        audioEnabled.checked = !!settings.audioEnabled;
+        audioSelect.disabled = !settings.audioEnabled;
+        audioSelect.style.opacity = settings.audioEnabled ? '1' : '.45';
+
+        audioEnabled.addEventListener('change', async e => {
+            settings.audioEnabled = !!e.target.checked;
+            audioSelect.disabled = !settings.audioEnabled;
+            audioSelect.style.opacity = settings.audioEnabled ? '1' : '.45';
+            saveSettings();
+            await startMicrophone();
+            if (settings.mode === 'online') {
+                try { onlinePeer?.close(); } catch {}
+                onlinePeer = null;
+                remoteStream = null;
+                remoteBoardStream = null;
+                remoteVideoTrackCount = 0;
+                if (onlineSocket?.readyState === WebSocket.OPEN && onlineCameraPeerId) {
+                    createOfferIfCaller().catch(console.warn);
+                }
+            }
+        });
+
+        audioSelect.addEventListener('change', async e => {
+            settings.audioDeviceId = e.target.value;
+            saveSettings();
+            if (settings.audioEnabled) await startMicrophone();
+        });
+sizeSelect.value =
             settings.size;
 
 
@@ -1168,6 +1621,40 @@
 
         updatePinDisplay();
 
+
+        boardEnabled.addEventListener('change', async e => {
+            settings.boardCameraEnabled = !!e.target.checked;
+            boardSelect.disabled = !settings.boardCameraEnabled;
+            boardSelect.style.opacity = settings.boardCameraEnabled ? '1' : '.45';
+            saveSettings();
+
+            await startBoardCamera();
+
+            // Rebuild WebRTC so the new track layout is negotiated cleanly.
+            if (settings.mode === 'online') {
+                const state = findMatchState();
+                const keepPeerId = onlineCameraPeerId;
+                stopOnlineMode();
+                onlineCameraPeerId = keepPeerId;
+                if (state) startOnlineMode();
+            }
+        });
+
+        boardSelect.addEventListener('change', async e => {
+            settings.boardDeviceId = e.target.value;
+            saveSettings();
+            if (settings.boardCameraEnabled) {
+                await startBoardCamera();
+
+                if (settings.mode === 'online') {
+                    const state = findMatchState();
+                    const keepPeerId = onlineCameraPeerId;
+                    stopOnlineMode();
+                    onlineCameraPeerId = keepPeerId;
+                    if (state) startOnlineMode();
+                }
+            }
+        });
 
         sizeSelect.addEventListener(
             'change',
@@ -1239,80 +1726,56 @@
     // ============================================================
 
     async function populateCameraList() {
+        const playerSelect = document.getElementById('maxlow-camera-select');
+        const boardSelect = document.getElementById('maxlow-board-camera-select');
+        const audioSelect = document.getElementById('maxlow-audio-select');
 
-        const select =
-            document.getElementById(
-                'maxlow-camera-select'
-            );
-
-
-        if (!select) return;
-
+        if (!playerSelect && !boardSelect && !audioSelect) return;
 
         try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const cameras = devices.filter(device => device.kind === 'videoinput');
+            const microphones = devices.filter(device => device.kind === 'audioinput');
 
-            const devices =
-                await navigator.mediaDevices
-                    .enumerateDevices();
+            const fill = (select, selectedId, defaultLabel) => {
+                if (!select) return;
+                select.innerHTML = `<option value="">${defaultLabel}</option>`;
 
-
-            const cameras =
-                devices.filter(
-                    device =>
-                        device.kind === 'videoinput'
-                );
-
-
-            select.innerHTML =
-                '<option value="">Default camera</option>';
-
-
-            cameras.forEach(
-                (camera, index) => {
-
-                    const option =
-                        document.createElement('option');
-
-
-                    option.value =
-                        camera.deviceId;
-
-
-                    option.textContent =
-                        camera.label ||
-                        `Camera ${index + 1}`;
-
-
+                cameras.forEach((camera, index) => {
+                    const option = document.createElement('option');
+                    option.value = camera.deviceId;
+                    option.textContent = camera.label || `Camera ${index + 1}`;
                     select.appendChild(option);
-                }
-            );
+                });
 
+                select.value = selectedId || '';
+            };
 
-            select.value =
-                settings.deviceId || '';
+            fill(playerSelect, settings.deviceId, 'Default camera');
+            fill(boardSelect, settings.boardDeviceId, 'Default / second camera');
 
+            if (audioSelect) {
+                audioSelect.innerHTML = '<option value="">Default microphone</option>';
+                microphones.forEach((mic, index) => {
+                    const option = document.createElement('option');
+                    option.value = mic.deviceId;
+                    option.textContent = mic.label || `Microphone ${index + 1}`;
+                    audioSelect.appendChild(option);
+                });
+                audioSelect.value = settings.audioDeviceId || '';
+            }
 
-            select.onchange =
-                async e => {
-
-                    settings.deviceId =
-                        e.target.value;
-
+            if (playerSelect) {
+                playerSelect.onchange = async e => {
+                    settings.deviceId = e.target.value;
                     saveSettings();
-
                     await startCamera();
                 };
-
-
+            }
         } catch (error) {
-
-            console.error(
-                'MAXLOW: Could not list cameras',
-                error
-            );
+            console.error('MAXLOW: Could not list cameras', error);
         }
     }
-
 
 
     // ============================================================
@@ -1410,6 +1873,7 @@
             if (cameraStream && video.srcObject !== cameraStream) {
                 video.srcObject = cameraStream;
             }
+            showBoardVideo(settings.boardCameraEnabled ? boardCameraStream : null);
             video.muted = true;
             if (cameraEnabled) wrapper.style.display = 'block';
             video.play().catch(() => {});
@@ -1433,6 +1897,7 @@
 
             video.muted = true;
             wrapper.style.display = cameraEnabled ? 'block' : 'none';
+            showBoardVideo(settings.boardCameraEnabled ? boardCameraStream : null);
             video.play().catch(() => {});
 
             if (lastTurnState !== true) {
@@ -1451,6 +1916,7 @@
 
         video.muted = true;
         wrapper.style.display = cameraEnabled ? 'block' : 'none';
+        showBoardVideo(remoteBoardStream);
         video.play().catch(() => {});
 
         if (lastTurnState !== false) {
@@ -1466,8 +1932,14 @@
     window.addEventListener('maxlow-sender-remote-stream', event => {
         const stream = event.detail?.stream;
         if (!stream) return;
-        remoteStream = stream;
-        console.log('MAXLOW: TWO-WAY RETURN CAMERA ATTACHED');
+
+        if (event.detail?.kind === 'board') {
+            remoteBoardStream = stream;
+            console.log('MAXLOW: TWO-WAY RETURN BOARD CAMERA ATTACHED');
+        } else {
+            remoteStream = stream;
+            console.log('MAXLOW: TWO-WAY RETURN PLAYER CAMERA ATTACHED');
+        }
         const state = findMatchState();
         if (state) showCorrectOnlineVideo(state);
     });
@@ -1507,12 +1979,52 @@
             onlinePeer.addTrack(track, cameraStream);
         });
 
-        onlinePeer.ontrack = event => {
-            console.log('MAXLOW: REMOTE TRACK RECEIVED');
+        if (settings.boardCameraEnabled && boardCameraStream) {
+            boardCameraStream.getTracks().forEach(track => {
+                onlinePeer.addTrack(track, boardCameraStream);
+            });
+        } else {
+            // Always reserve the second video m-line so a paired sender can
+            // optionally return a board camera without making it mandatory.
+            onlinePeer.addTransceiver('video', { direction: 'recvonly' });
+        }
 
-            remoteStream =
+        if (settings.audioEnabled && microphoneStream) {
+            microphoneStream.getAudioTracks().forEach(track => onlinePeer.addTrack(track, microphoneStream));
+        } else {
+            onlinePeer.addTransceiver('audio', { direction: 'recvonly' });
+        }
+
+        onlineChatChannel = onlinePeer.createDataChannel('maxlow-chat', { ordered:true });
+        setChatChannel(onlineChatChannel);
+
+        remoteVideoTrackCount = 0;
+
+        onlinePeer.ontrack = event => {
+            const incoming =
                 event.streams?.[0] ||
                 new MediaStream([event.track]);
+
+            if (event.track.kind === 'audio') {
+                remoteAudioStream = incoming;
+                playRemoteAudio(incoming);
+                console.log('MAXLOW: REMOTE AUDIO RECEIVED');
+                return;
+            }
+
+            const isBoardTrack = remoteVideoTrackCount > 0;
+            remoteVideoTrackCount++;
+
+            if (isBoardTrack) {
+                remoteBoardStream = incoming;
+                console.log('MAXLOW: REMOTE OCHE TRACK RECEIVED');
+                const state = findMatchState();
+                if (state) showCorrectOnlineVideo(state);
+                return;
+            }
+
+            console.log('MAXLOW: REMOTE PLAYER TRACK RECEIVED');
+            remoteStream = incoming;
 
             const video = createCamera();
             video.srcObject = remoteStream;
@@ -1566,6 +2078,8 @@
                     try { onlinePeer?.close(); } catch {}
                     onlinePeer = null;
                     remoteStream = null;
+                    remoteBoardStream = null;
+                    remoteVideoTrackCount = 0;
                     pendingIce = [];
 
                     console.log('MAXLOW: ATTEMPTING AUTOMATIC VIDEO RECOVERY');
@@ -1748,13 +2262,239 @@
         onlinePeer = null;
         onlineSocket = null;
         remoteStream = null;
+        remoteBoardStream = null;
+        remoteAudioStream = null;
+        remoteVideoTrackCount = 0;
+        setChatChannel(null);
+        const remoteAudio = document.getElementById('maxlow-remote-audio');
+        if (remoteAudio) remoteAudio.srcObject = null;
+        showBoardVideo(null);
         pendingIce = [];
         onlineIdentity = null;
         lastTurnState = null;
     }
 
+    function stopAllCameraCapture() {
+        if (cameraStream) {
+            cameraStream.getTracks().forEach(track => track.stop());
+            cameraStream = null;
+        }
+
+        if (boardCameraStream) {
+            boardCameraStream.getTracks().forEach(track => track.stop());
+            boardCameraStream = null;
+        }
+
+        const video = document.getElementById(CAMERA_ID);
+        if (video) video.srcObject = null;
+
+        showBoardVideo(null);
+
+        const wrapper = document.getElementById(WRAPPER_ID);
+        if (wrapper) wrapper.style.display = 'none';
+
+        cameraEnabled = false;
+        updateCamButton();
+    }
+
+    function matchLooksFinished(state) {
+        try {
+            const finishedValues = new Set([
+                'finished', 'complete', 'completed', 'ended',
+                'gameover', 'game_over', 'game-over'
+            ]);
+
+            const candidates = [
+                state,
+                state?.game,
+                state?.match,
+                state?.gameClient,
+                state?.gameClient?.state
+            ].filter(Boolean);
+
+            for (const obj of candidates) {
+                for (const key of ['status', 'state', 'phase', 'gameStatus', 'matchStatus']) {
+                    const value = String(obj?.[key] ?? '').toLowerCase().replace(/\s+/g, '');
+                    if (finishedValues.has(value)) return true;
+                }
+
+                for (const key of [
+                    'finished', 'isFinished', 'complete', 'completed',
+                    'gameOver', 'isGameOver', 'ended', 'isEnded'
+                ]) {
+                    if (obj?.[key] === true) return true;
+                }
+
+                // Common winner/result signals.
+                if (obj?.winnerId || obj?.winner || obj?.winningPlayerId) return true;
+            }
+
+            const path = location.pathname.toLowerCase();
+            const bodyText = (document.body?.innerText || '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .toLowerCase();
+
+            // Result/end controls Autodarts may show after the winning dart.
+            const exactEndControls = new Set([
+                'rematch', 'play again', 'new match', 'back to lobby',
+                'leave match', 'match finished', 'game finished'
+            ]);
+
+            const controls = [...document.querySelectorAll('button, [role="button"], a')];
+            for (const el of controls) {
+                const label = String(
+                    el.innerText || el.textContent ||
+                    el.getAttribute('aria-label') ||
+                    el.getAttribute('title') || ''
+                ).trim().toLowerCase();
+                if (exactEndControls.has(label)) return true;
+            }
+
+            // Strong result phrases. Avoid generic "winner" alone because themes may contain it.
+            const resultPhrases = [
+                'match complete', 'match completed', 'match finished',
+                'game complete', 'game completed', 'game finished',
+                'play again', 'back to lobby'
+            ];
+            if (resultPhrases.some(p => bodyText.includes(p))) return true;
+
+            // If Autodarts has navigated away from the active /matches/<id> route,
+            // an online camera session must not remain alive.
+            if (onlineIdentity?.matchId && !path.includes(`/matches/${String(onlineIdentity.matchId).toLowerCase()}`)) {
+                return true;
+            }
+        } catch (error) {
+            console.warn('MAXLOW: match-end detection error', error);
+        }
+
+        return false;
+    }
+
+
+    async function runWorkingAudioResetPath() {
+        // This intentionally mirrors the LIVE AUDIO toggle path from v0.9.12.
+        settings.audioEnabled = false;
+        saveSettings();
+        await startMicrophone();
+
+        if (settings.mode === 'online') {
+            try { onlinePeer?.close(); } catch {}
+            onlinePeer = null;
+            remoteStream = null;
+            remoteBoardStream = null;
+            remoteVideoTrackCount = 0;
+        }
+    }
+
+
+
+    function stopMaxlowAudioOnHistory() {
+        if (!location.pathname.toLowerCase().includes('/history/matches/')) return;
+
+        // Stop the local microphone capture.
+        try { microphoneStream?.getTracks().forEach(track => track.stop()); } catch {}
+        microphoneStream = null;
+
+        // Stop/clear every remote audio element used by Maxlow.
+        const knownAudio = document.getElementById('maxlow-remote-audio');
+        if (knownAudio) {
+            try { knownAudio.pause(); } catch {}
+            try { knownAudio.srcObject?.getTracks().forEach(track => track.stop()); } catch {}
+            knownAudio.srcObject = null;
+            try { knownAudio.removeAttribute('src'); } catch {}
+            try { knownAudio.load(); } catch {}
+        }
+
+        // Belt-and-braces: clear audio tracks from the stored remote stream too.
+        try { remoteAudioStream?.getTracks().forEach(track => track.stop()); } catch {}
+        remoteAudioStream = null;
+    }
+
+    function removeMaxlowCameraViewsOnHistory() {
+        if (!location.pathname.toLowerCase().includes('/history/matches/')) return;
+
+        for (const id of [WRAPPER_ID, BOARD_WRAPPER_ID]) {
+            const wrapper = document.getElementById(id);
+            if (wrapper) wrapper.remove();
+        }
+
+        // Also remove any stale Maxlow video nodes if a wrapper was recreated oddly.
+        for (const id of [CAMERA_ID, BOARD_CAMERA_ID]) {
+            const video = document.getElementById(id);
+            if (video) {
+                try { video.pause(); } catch {}
+                try { video.srcObject = null; } catch {}
+                video.remove();
+            }
+        }
+    }
+
+    // Autodarts is a SPA, so watch continuously for the result/history route
+    // and remove any camera UI that gets recreated after navigation.
+    window.setInterval(() => {
+        removeMaxlowCameraViewsOnHistory();
+        stopMaxlowAudioOnHistory();
+    }, 100);
+
+    async function finishOnlineMatch() {
+        const matchId = onlineIdentity?.matchId || getMatchId() || '';
+        if (matchId) endedMatchId = matchId;
+
+        console.log('MAXLOW: MATCH FINISHED - USING WORKING AUDIO RESET PATH');
+        await runWorkingAudioResetPath();
+        stopOnlineMode();
+        stopAllCameraCapture();
+        setTimeout(() => {
+            removeMaxlowCameraViewsOnHistory();
+            stopMaxlowAudioOnHistory();
+        }, 0);
+        setTimeout(() => {
+            removeMaxlowCameraViewsOnHistory();
+            stopMaxlowAudioOnHistory();
+        }, 150);
+
+        // Force the visual overlays away immediately at match end.
+        const mainWrapper = document.getElementById(WRAPPER_ID);
+        const boardWrapper = document.getElementById(BOARD_WRAPPER_ID);
+        if (mainWrapper) mainWrapper.style.setProperty('display', 'none', 'important');
+        if (boardWrapper) boardWrapper.style.setProperty('display', 'none', 'important');
+
+        const chatPanel = document.getElementById('maxlow-chat-panel');
+        if (chatPanel) chatPanel.remove();
+    }
+
+
+    document.addEventListener('click', event => {
+        const control = event.target?.closest?.('button, [role="button"], a');
+        if (!control) return;
+
+        const label = String(
+            control.innerText || control.textContent ||
+            control.getAttribute('aria-label') ||
+            control.getAttribute('title') || ''
+        ).replace(/\s+/g, ' ').trim().toLowerCase();
+
+        const endActions = [
+            'abort', 'surrender', 'leave match', 'leave game',
+            'quit match', 'quit game', 'back to lobby'
+        ];
+
+        if (endActions.some(action => label === action || label.includes(action))) {
+            console.log('MAXLOW: END ACTION CLICKED:', label);
+            setTimeout(() => finishOnlineMatch().catch(console.warn), 150);
+        }
+    }, true);
+
     function startOnlineMode() {
         if (settings.mode !== 'online') return;
+
+        const currentMatchId = getMatchId();
+        if (endedMatchId && currentMatchId === endedMatchId) return;
+        if (endedMatchId && currentMatchId && currentMatchId !== endedMatchId) {
+            endedMatchId = '';
+        }
+
         intentionalOnlineStop = false;
         if (!location.pathname.includes('/matches/')) return;
 
@@ -1797,10 +2537,35 @@
     }
 
     // Autodarts changes React state without reloading the page.
-    setInterval(() => {
+    setInterval(async () => {
         if (settings.mode !== 'online') return;
 
+        const currentMatchId = getMatchId();
+
+        // Leaving the match route also guarantees teardown.
+        if (onlineIdentity && !currentMatchId) {
+            finishOnlineMatch();
+            return;
+        }
+
         const state = findMatchState();
+
+        if (onlineIdentity && matchLooksFinished(state)) {
+            finishOnlineMatch();
+            return;
+        }
+
+        if (endedMatchId && currentMatchId === endedMatchId) return;
+
+        if (endedMatchId && currentMatchId && currentMatchId !== endedMatchId) {
+            endedMatchId = '';
+        }
+
+        // A new match can restart capture automatically after the previous
+        // match deliberately released both cameras.
+        if (currentMatchId && !cameraStream) {
+            await startCamera();
+        }
 
         if (state) {
             showCorrectOnlineVideo(state);
@@ -1829,6 +2594,9 @@
     setTimeout(
         async () => {
             await startCamera();
+            if (settings.boardCameraEnabled && !boardCameraStream) {
+                await startBoardCamera();
+            }
 
             if (settings.mode === 'online') {
                 setTimeout(startOnlineMode, 750);
@@ -1849,8 +2617,15 @@
     let socket = null;
     let peer = null;
     let localStream = null;
+    let boardStream = null;
+    let microphoneStream = null;
     let pendingIce = [];
+    let remoteTrackCount = 0;
     let cameraId = localStorage.getItem('maxlowSenderCameraId') || '';
+    let boardCameraId = localStorage.getItem('maxlowSenderBoardCameraId') || '';
+    let boardEnabled = localStorage.getItem('maxlowSenderBoardEnabled') === 'true';
+    let audioEnabled = localStorage.getItem('maxlowSenderAudioEnabled') === 'true';
+    let audioDeviceId = localStorage.getItem('maxlowSenderAudioDeviceId') || '';
     let senderId = sessionStorage.getItem('maxlowSenderId');
 
     if (!senderId) {
@@ -1881,16 +2656,40 @@
 
         const panel = el('div');
         Object.assign(panel.style, {
-            width: 'min(92vw, 520px)', background: '#111827', color: '#fff',
-            border: '1px solid #374151', borderRadius: '12px',
-            padding: '22px', boxShadow: '0 20px 60px rgba(0,0,0,.55)'
+            width: 'min(92vw, 520px)',
+            background: 'linear-gradient(180deg, rgba(8,13,22,.99), rgba(3,7,13,.99))',
+            color: '#fff',
+            border: '1px solid #2388ff',
+            borderRadius: '6px',
+            padding: '18px',
+            boxShadow: '0 0 0 1px rgba(215,25,32,.65), 0 0 24px rgba(35,136,255,.25), 0 20px 60px rgba(0,0,0,.7)'
         });
 
-        const title = el('div', { textContent: 'MAXLOW DESIGNS' });
-        Object.assign(title.style, { fontSize:'22px', fontWeight:'800', textAlign:'center' });
+        const brand = el('div');
+        Object.assign(brand.style, {
+            display:'flex', justifyContent:'center', alignItems:'center',
+            margin:'0 auto 5px', width:'max-content',
+            fontSize:'16px', fontWeight:'900', lineHeight:'27px',
+            fontFamily:'Arial, sans-serif', borderRadius:'2px', overflow:'hidden',
+            boxShadow:'0 0 10px rgba(0,0,0,.6)'
+        });
+        const brandBlue = el('span', { textContent:'Maxlow' });
+        Object.assign(brandBlue.style, { background:'#1558b0', color:'#fff', padding:'0 10px' });
+        const brandRed = el('span', { textContent:'Designs' });
+        Object.assign(brandRed.style, { background:'#d71920', color:'#fff', padding:'0 10px' });
+        brand.append(brandBlue, brandRed);
+
+        const title = el('div', { textContent: 'PIN INPUT' });
+        Object.assign(title.style, {
+            fontSize:'11px', fontWeight:'900', textAlign:'center',
+            letterSpacing:'1.6px', color:'#cbd5e1', marginTop:'7px'
+        });
 
         const subtitle = el('div', { textContent: 'PLAYER CAMERA SENDER' });
-        Object.assign(subtitle.style, { fontSize:'13px', textAlign:'center', opacity:'.75', margin:'4px 0 18px' });
+        Object.assign(subtitle.style, {
+            fontSize:'10px', textAlign:'center', opacity:'.65',
+            letterSpacing:'.8px', margin:'4px 0 16px'
+        });
 
         const pin = el('input', {
             id: 'maxlow-sender-pin', placeholder: '6 DIGIT PIN',
@@ -1899,7 +2698,7 @@
         Object.assign(pin.style, {
             width:'100%', boxSizing:'border-box', padding:'13px',
             fontSize:'24px', letterSpacing:'8px', textAlign:'center',
-            borderRadius:'7px', border:'1px solid #4b5563',
+            borderRadius:'3px', border:'1px solid #315b87',
             background:'#030712', color:'#fff', outline:'none'
         });
         pin.addEventListener('input', () => pin.value = pin.value.replace(/\D/g,'').slice(0,6));
@@ -1907,55 +2706,182 @@
         const select = el('select', { id:'maxlow-sender-camera' });
         Object.assign(select.style, {
             width:'100%', boxSizing:'border-box', marginTop:'12px', padding:'10px',
-            borderRadius:'7px', border:'1px solid #4b5563',
+            borderRadius:'3px', border:'1px solid #315b87',
             background:'#030712', color:'#fff'
         });
+
+        const boardToggleLabel = el('label');
+        Object.assign(boardToggleLabel.style, {
+            display:'flex', alignItems:'center', gap:'8px', marginTop:'12px',
+            fontSize:'12px', fontWeight:'800'
+        });
+
+        const boardToggle = el('input', { type:'checkbox', checked:boardEnabled });
+        const boardToggleText = el('span', { textContent:'OCHE CAMERA' });
+        boardToggleLabel.append(boardToggle, boardToggleText);
+
+        const boardSelect = el('select', { id:'maxlow-sender-board-camera' });
+        Object.assign(boardSelect.style, {
+            width:'100%', boxSizing:'border-box', marginTop:'8px', padding:'10px',
+            borderRadius:'3px', border:'1px solid #315b87',
+            background:'#030712', color:'#fff'
+        });
+        boardSelect.disabled = !boardEnabled;
+        boardSelect.style.opacity = boardEnabled ? '1' : '.45';
+
+        const boardPreview = el('video', {
+            id:'maxlow-sender-board-preview', autoplay:true, muted:true, playsInline:true
+        });
+        Object.assign(boardPreview.style, {
+            width:'100%', aspectRatio:'16/9', objectFit:'cover', background:'#000',
+            borderRadius:'3px', border:'1px solid #315b87', marginTop:'8px', display:boardEnabled ? 'block' : 'none'
+        });
+
+        const audioToggleLabel = el('label');
+        Object.assign(audioToggleLabel.style, {
+            display:'flex', alignItems:'center', gap:'8px', marginTop:'12px',
+            fontSize:'12px', fontWeight:'800'
+        });
+        const audioToggle = el('input', { type:'checkbox', checked:audioEnabled });
+        const audioToggleText = el('span', { textContent:'LIVE AUDIO' });
+        audioToggleLabel.append(audioToggle, audioToggleText);
+
+        const audioSelect = el('select', { id:'maxlow-sender-audio' });
+        Object.assign(audioSelect.style, {
+            width:'100%', boxSizing:'border-box', marginTop:'8px', padding:'10px',
+            borderRadius:'3px', border:'1px solid #315b87',
+            background:'#030712', color:'#fff'
+        });
+        audioSelect.disabled = !audioEnabled;
+        audioSelect.style.opacity = audioEnabled ? '1' : '.45';
 
         const preview = el('video', { id:'maxlow-sender-preview', autoplay:true, muted:true, playsInline:true });
         Object.assign(preview.style, {
             width:'100%', aspectRatio:'16/9', objectFit:'cover', background:'#000',
-            borderRadius:'8px', marginTop:'12px'
+            borderRadius:'3px', border:'1px solid #315b87', marginTop:'12px'
         });
 
         const status = el('div', { id:'maxlow-sender-status', textContent:'Camera not started' });
         Object.assign(status.style, { textAlign:'center', margin:'12px 0', fontWeight:'700', fontSize:'13px' });
 
-        const start = el('button', { textContent:'START / CHOOSE CAMERA' });
-        const connect = el('button', { textContent:'CONNECT CAMERA' });
+        const start = el('button', { textContent:'START / CHOOSE CAMERAS' });
+        const connect = el('button', { textContent:'CONNECT CAMERAS' });
         const disconnect = el('button', { textContent:'DISCONNECT' });
         const close = el('button', { textContent:'CLOSE' });
 
-        for (const b of [start, connect, disconnect, close]) {
+        const buttonStyles = [
+            [start, '#1558b0', 'START / CHOOSE CAMERAS'],
+            [connect, '#d71920', 'CONNECT CAMERAS'],
+            [disconnect, '#111827', 'DISCONNECT'],
+            [close, '#05080d', 'CLOSE']
+        ];
+        for (const [b, bg, label] of buttonStyles) {
+            b.textContent = label;
             Object.assign(b.style, {
-                width:'100%', padding:'11px', marginTop:'8px', border:'0',
-                borderRadius:'7px', cursor:'pointer', fontWeight:'800'
+                width:'100%', padding:'11px', marginTop:'8px',
+                border:'1px solid rgba(255,255,255,.25)',
+                borderRadius:'3px', cursor:'pointer', fontWeight:'900',
+                background:bg, color:'#fff', letterSpacing:'.35px',
+                boxShadow: bg === '#1558b0'
+                    ? '0 0 12px rgba(35,136,255,.28)'
+                    : bg === '#d71920'
+                    ? '0 0 12px rgba(215,25,32,.25)'
+                    : 'none'
             });
         }
 
-        start.onclick = () => startCamera(select, preview, status);
+        boardToggle.addEventListener('change', async () => {
+            boardEnabled = !!boardToggle.checked;
+            localStorage.setItem('maxlowSenderBoardEnabled', String(boardEnabled));
+            boardSelect.disabled = !boardEnabled;
+            boardSelect.style.opacity = boardEnabled ? '1' : '.45';
+            boardPreview.style.display = boardEnabled ? 'block' : 'none';
+
+            if (!boardEnabled && boardStream) {
+                boardStream.getTracks().forEach(t => t.stop());
+                boardStream = null;
+                boardPreview.srcObject = null;
+            }
+        });
+
+        boardSelect.addEventListener('change', () => {
+            boardCameraId = boardSelect.value;
+            if (boardCameraId) localStorage.setItem('maxlowSenderBoardCameraId', boardCameraId);
+        });
+
+        audioToggle.addEventListener('change', async () => {
+            audioEnabled = !!audioToggle.checked;
+            localStorage.setItem('maxlowSenderAudioEnabled', String(audioEnabled));
+            audioSelect.disabled = !audioEnabled;
+            audioSelect.style.opacity = audioEnabled ? '1' : '.45';
+            if (!audioEnabled) {
+                try { microphoneStream?.getTracks().forEach(t => t.stop()); } catch {}
+                microphoneStream = null;
+            }
+        });
+
+        audioSelect.addEventListener('change', () => {
+            audioDeviceId = audioSelect.value;
+            localStorage.setItem('maxlowSenderAudioDeviceId', audioDeviceId);
+        });
+
+        start.onclick = async () => {
+            await startCamera(select, preview, status);
+            if (boardEnabled) await startBoardCameraSender(boardSelect, boardPreview, status);
+            if (audioEnabled) await startMicrophoneSender(audioSelect, status);
+        };
         connect.onclick = () => connectToPin(pin.value, status);
         disconnect.onclick = () => disconnectSender(status);
         close.onclick = () => overlay.remove();
 
-        panel.append(title, subtitle, pin, select, preview, status, start, connect, disconnect, close);
+        const playerCameraLabel = el('div', { textContent:'BOARD CAMERA' });
+        Object.assign(playerCameraLabel.style, {
+            fontSize:'11px', fontWeight:'900', letterSpacing:'.5px',
+            margin:'0 0 5px', color:'#fff'
+        });
+
+        panel.append(
+            brand, title, subtitle, pin, playerCameraLabel,
+            select, preview,
+            boardToggleLabel, boardSelect, boardPreview,
+            audioToggleLabel, audioSelect,
+            status, start, connect, disconnect, close
+        );
         overlay.append(panel);
         document.body.append(overlay);
 
-        loadCameras(select).catch(console.warn);
+        loadCameras(select, boardSelect, audioSelect).catch(console.warn);
     }
 
-    async function loadCameras(select) {
+    async function loadCameras(select, boardSelect = null, audioSelect = null) {
         const devices = await navigator.mediaDevices.enumerateDevices();
         const cams = devices.filter(d => d.kind === 'videoinput');
-        select.innerHTML = '';
-        cams.forEach((cam, i) => {
-            const option = el('option', {
-                value: cam.deviceId,
-                textContent: cam.label || `Camera ${i + 1}`
+        const mics = devices.filter(d => d.kind === 'audioinput');
+
+        const fill = (target, selectedId) => {
+            if (!target) return;
+            target.innerHTML = '';
+            cams.forEach((cam, i) => {
+                const option = el('option', {
+                    value: cam.deviceId,
+                    textContent: cam.label || `Camera ${i + 1}`
+                });
+                if (cam.deviceId === selectedId) option.selected = true;
+                target.append(option);
             });
-            if (cam.deviceId === cameraId) option.selected = true;
-            select.append(option);
-        });
+        };
+
+        fill(select, cameraId);
+        fill(boardSelect, boardCameraId);
+
+        if (audioSelect) {
+            audioSelect.innerHTML = '<option value="">Default microphone</option>';
+            mics.forEach((mic, i) => {
+                const option = el('option', { value:mic.deviceId, textContent:mic.label || `Microphone ${i + 1}` });
+                audioSelect.append(option);
+            });
+            audioSelect.value = audioDeviceId || '';
+        }
     }
 
     async function startCamera(select, preview, status) {
@@ -1988,9 +2914,73 @@
         }
     }
 
+    async function startBoardCameraSender(select, preview, status) {
+        if (!boardEnabled) return;
+
+        try {
+            if (boardStream) boardStream.getTracks().forEach(t => t.stop());
+
+            const chosen = select.value || boardCameraId;
+            if (!chosen) {
+                status.textContent = 'CHOOSE A BOARD CAMERA';
+                return;
+            }
+
+            // Prevent accidentally selecting the same physical camera twice.
+            if (chosen === cameraId) {
+                status.textContent = 'BOARD CAMERA MUST BE A DIFFERENT CAMERA';
+                return;
+            }
+
+            boardStream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    deviceId: { exact: chosen },
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                },
+                audio: false
+            });
+
+            preview.srcObject = boardStream;
+            const track = boardStream.getVideoTracks()[0];
+            boardCameraId = track.getSettings().deviceId || chosen;
+            localStorage.setItem('maxlowSenderBoardCameraId', boardCameraId);
+            status.textContent = 'PLAYER + BOARD CAMERAS READY';
+            console.log('SEND MY CAMERA: BOARD CAMERA READY');
+        } catch (e) {
+            boardStream = null;
+            preview.srcObject = null;
+            status.textContent = 'BOARD CAMERA ERROR - CHECK PERMISSION';
+            console.error('SEND MY CAMERA board camera error', e);
+        }
+    }
+
     function send(data) {
         if (socket?.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify(data));
+        }
+    }
+
+
+    async function startMicrophoneSender(select, status) {
+        if (!audioEnabled) return;
+        try {
+            try { microphoneStream?.getTracks().forEach(t => t.stop()); } catch {}
+            audioDeviceId = select?.value || audioDeviceId || '';
+            localStorage.setItem('maxlowSenderAudioDeviceId', audioDeviceId);
+
+            microphoneStream = await navigator.mediaDevices.getUserMedia({
+                video:false,
+                audio: audioDeviceId
+                    ? { deviceId:{ exact:audioDeviceId }, echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+                    : { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+            });
+            status.textContent = boardEnabled ? 'PLAYER + BOARD + AUDIO READY' : 'PLAYER + AUDIO READY';
+            console.log('SEND MY CAMERA: MICROPHONE READY');
+        } catch (e) {
+            console.error('SEND MY CAMERA microphone error', e);
+            microphoneStream = null;
+            status.textContent = 'MICROPHONE ERROR - CHECK PERMISSION';
         }
     }
 
@@ -2003,17 +2993,60 @@
 
         localStream.getTracks().forEach(track => peer.addTrack(track, localStream));
 
-        // Receive the PIN owner's camera back over this same connection.
+        if (boardEnabled && boardStream) {
+            boardStream.getTracks().forEach(track => peer.addTrack(track, boardStream));
+        }
+
+        if (audioEnabled && microphoneStream) {
+            microphoneStream.getAudioTracks().forEach(track => peer.addTrack(track, microphoneStream));
+        }
+
+        peer.ondatachannel = event => {
+            if (event.channel?.label === 'maxlow-chat') {
+                window.__maxlowChatChannel = event.channel;
+                if (typeof window.maxlowSetChatChannel === 'function') window.maxlowSetChatChannel(event.channel);
+                else {
+                    event.channel.onmessage = e => {
+                        if (typeof window.maxlowChatReceive === 'function') window.maxlowChatReceive(String(e.data || ''));
+                    };
+                }
+            }
+        };
+
+        remoteTrackCount = 0;
+
+        // Receive the PIN owner's player camera and optional board camera back.
         peer.ontrack = event => {
             const incoming =
                 event.streams?.[0] ||
                 new MediaStream([event.track]);
 
-            window.__maxlowSenderRemoteStream = incoming;
+            if (event.track.kind === 'audio') {
+                let audio = document.getElementById('maxlow-remote-audio');
+                if (!audio) {
+                    audio = document.createElement('audio');
+                    audio.id = 'maxlow-remote-audio';
+                    audio.autoplay = true;
+                    audio.playsInline = true;
+                    document.body.appendChild(audio);
+                }
+                audio.srcObject = incoming;
+                audio.play().catch(() => console.warn('SEND MY CAMERA: click page once to allow audio'));
+                console.log('SEND MY CAMERA: RETURN AUDIO RECEIVED');
+                return;
+            }
+
+            const kind = remoteTrackCount > 0 ? 'board' : 'player';
+            remoteTrackCount++;
+
+            if (kind === 'player') window.__maxlowSenderRemoteStream = incoming;
+            else window.__maxlowSenderRemoteBoardStream = incoming;
+
             window.dispatchEvent(new CustomEvent('maxlow-sender-remote-stream', {
-                detail: { stream: incoming }
+                detail: { stream: incoming, kind }
             }));
-            console.log('SEND MY CAMERA: RETURN CAMERA RECEIVED');
+
+            console.log(`SEND MY CAMERA: RETURN ${kind.toUpperCase()} CAMERA RECEIVED`);
         };
 
         peer.onicecandidate = e => {
@@ -2047,6 +3080,15 @@
         }
         if (!localStream) {
             status.textContent = 'START CAMERA FIRST';
+            return;
+        }
+
+        if (boardEnabled && !boardStream) {
+            status.textContent = 'START / CHOOSE OCHE CAMERA FIRST';
+            return;
+        }
+        if (audioEnabled && !microphoneStream) {
+            status.textContent = 'START / CHOOSE MICROPHONE FIRST';
             return;
         }
 
@@ -2117,10 +3159,25 @@
     function disconnectSender(status) {
         try { peer?.close(); } catch {}
         try { socket?.close(); } catch {}
+        try { localStream?.getTracks().forEach(t => t.stop()); } catch {}
+        try { boardStream?.getTracks().forEach(t => t.stop()); } catch {}
+        try { microphoneStream?.getTracks().forEach(t => t.stop()); } catch {}
+
         peer = null;
         socket = null;
+        localStream = null;
+        boardStream = null;
+        microphoneStream = null;
+        if (typeof window.maxlowSetChatChannel === 'function') window.maxlowSetChatChannel(null);
         pendingIce = [];
-        status.textContent = 'DISCONNECTED';
+        remoteTrackCount = 0;
+
+        const preview = document.getElementById('maxlow-sender-preview');
+        const boardPreview = document.getElementById('maxlow-sender-board-preview');
+        if (preview) preview.srcObject = null;
+        if (boardPreview) boardPreview.srcObject = null;
+
+        status.textContent = 'DISCONNECTED - CAMERAS RELEASED';
     }
 
     function addButton() {
@@ -2140,6 +3197,24 @@
 
         button.onclick = openSender;
         document.body.append(button);
+
+        if (!document.getElementById('maxlow-chat-button')) {
+            const chat = el('button', {
+                id:'maxlow-chat-button',
+                textContent:'CHAT'
+            });
+            Object.assign(chat.style, {
+                position:'fixed', top:'12px', right:'104px', zIndex:'2147483000',
+                padding:'8px 12px', border:'1px solid rgba(255,255,255,.25)',
+                borderRadius:'3px', background:'#1558b0', color:'#fff',
+                fontWeight:'900', fontSize:'12px', cursor:'pointer',
+                boxShadow:'0 0 10px rgba(35,136,255,.25)'
+            });
+            chat.onclick = () => {
+                if (typeof window.maxlowOpenChat === 'function') window.maxlowOpenChat();
+            };
+            document.body.append(chat);
+        }
     }
 
     addButton();
