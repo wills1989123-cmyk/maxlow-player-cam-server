@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Maxlow Player Cam
 // @namespace    maxlow-designs
-// @version      0.9.18-two-cam-board-clear
+// @version      1.0.0
 // @description  Maxlow Player Cam: player cam + board cam + live audio + peer-to-peer chat
 // @match        https://play.autodarts.com/*
+// @updateURL    https://raw.githubusercontent.com/wills1989123-cmyk/maxlow-player-cam-server/main/maxlow-player-cam.user.js
+// @downloadURL  https://raw.githubusercontent.com/wills1989123-cmyk/maxlow-player-cam-server/main/maxlow-player-cam.user.js
 // @grant        none
 // ==/UserScript==
 
