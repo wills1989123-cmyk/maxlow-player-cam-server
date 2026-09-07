@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Maxlow Player Cam
 // @namespace    maxlow-designs
-// @version      0.9.18
+// @version      0.9.18-two-cam-board-clear
 // @description  Maxlow Player Cam: player cam + board cam + live audio + peer-to-peer chat
 // @match        https://play.autodarts.com/*
 // @grant        none
@@ -10,7 +10,7 @@
 (function () {
     'use strict';
 
-    
+
     const maxlowPinBroadcastCss = '\n/* ===== MAXLOW v0.8.2 — PIN INPUT BROADCAST STYLE ===== */\n#maxlow-pin-input-button,\n#maxlow-pin-input-btn,\nbutton[data-maxlow-pin-input],\n.maxlow-pin-input-button {\n    background: linear-gradient(90deg, #1558b0 0 50%, #d71920 50% 100%) !important;\n    color: #fff !important;\n    border: 1px solid rgba(255,255,255,.65) !important;\n    border-radius: 3px !important;\n    box-shadow: 0 0 10px rgba(34,137,255,.35), 0 0 10px rgba(255,45,45,.25) !important;\n    font-weight: 900 !important;\n    letter-spacing: .4px !important;\n}\n\n/* Sender / PIN panel: dark broadcast card with Maxlow blue/red trim */\n#maxlow-sender-overlay,\n#maxlow-pin-overlay,\n.maxlow-sender-overlay,\n.maxlow-pin-overlay {\n    background: rgba(6,10,18,.97) !important;\n    border: 1px solid #2388ff !important;\n    border-radius: 7px !important;\n    box-shadow: 0 0 0 1px rgba(230,30,35,.55), 0 0 20px rgba(0,0,0,.7) !important;\n}\n\n/* Any obvious PIN heading inside the sender panel */\n#maxlow-sender-overlay h1,\n#maxlow-sender-overlay h2,\n#maxlow-sender-overlay h3,\n#maxlow-pin-overlay h1,\n#maxlow-pin-overlay h2,\n#maxlow-pin-overlay h3 {\n    color: #fff !important;\n    text-transform: uppercase !important;\n    letter-spacing: .7px !important;\n}\n\n/* Reusable Maxlow Designs badge used by the script */\n.maxlow-pin-brand {\n    display:flex;\n    align-items:center;\n    width:max-content;\n    overflow:hidden;\n    border-radius:2px;\n    font-family:Arial,Helvetica,sans-serif;\n    font-size:12px;\n    line-height:20px;\n    font-weight:900;\n    color:#fff;\n    box-shadow:0 0 8px rgba(0,0,0,.5);\n}\n.maxlow-pin-brand .maxlow-blue { background:#1558b0; padding:0 7px; }\n.maxlow-pin-brand .maxlow-red  { background:#d71920; padding:0 7px; }\n';
     try {
         if (typeof GM_addStyle === 'function') GM_addStyle(maxlowPinBroadcastCss);
@@ -55,7 +55,7 @@ const CAMERA_ID = 'maxlow-live-player-cam';
 
     const defaults = {
         deviceId: '',
-        boardCameraEnabled: false,
+        boardCameraEnabled: true,
         boardDeviceId: '',
         audioEnabled: false,
         audioDeviceId: '',
@@ -65,6 +65,16 @@ const CAMERA_ID = 'maxlow-live-player-cam';
     };
 
     let settings = loadSettings();
+
+    // TWO-CAMERA UPGRADE:
+    // Enable the existing Oche Camera feature once for users upgrading from
+    // the one-camera build. After this first upgrade, the normal settings
+    // toggle remains in control.
+    if (localStorage.getItem('maxlow-two-camera-upgrade-v1') !== 'done') {
+        settings.boardCameraEnabled = true;
+        saveSettings();
+        localStorage.setItem('maxlow-two-camera-upgrade-v1', 'done');
+    }
 
     function loadSettings() {
         try {
@@ -803,6 +813,15 @@ const CAMERA_ID = 'maxlow-live-player-cam';
         `;
         boardWrapper.appendChild(frame);
         document.body.appendChild(boardWrapper);
+
+        // Keep the right-hand Board Camera clear of the central dartboard.
+        // Only the Board Camera gets this slightly narrower/right-edge layout.
+        Object.assign(boardWrapper.style, {
+            right: '12px',
+            left: 'auto',
+            width: '440px',
+            maxWidth: 'calc(100vw - 24px)'
+        });
         applyBoardCameraLayout();
         return video;
     }
@@ -858,28 +877,61 @@ const CAMERA_ID = 'maxlow-live-player-cam';
                 boardCameraStream = null;
             }
 
-            const constraints = settings.boardDeviceId
-                ? {
-                    deviceId: { exact: settings.boardDeviceId },
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 }
+            // Work out which physical camera the main camera is actually using.
+            const mainDeviceId =
+                cameraStream?.getVideoTracks?.()[0]?.getSettings?.().deviceId ||
+                settings.deviceId ||
+                '';
+
+            // If no Oche camera has been selected yet, automatically choose
+            // the first camera that is DIFFERENT from the main camera.
+            let chosenBoardId = settings.boardDeviceId || '';
+
+            if (!chosenBoardId || chosenBoardId === mainDeviceId) {
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const cameras = devices.filter(d => d.kind === 'videoinput');
+
+                const secondCamera = cameras.find(cam =>
+                    cam.deviceId &&
+                    cam.deviceId !== mainDeviceId
+                );
+
+                if (secondCamera) {
+                    chosenBoardId = secondCamera.deviceId;
+                    settings.boardDeviceId = chosenBoardId;
+                    saveSettings();
                 }
-                : {
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 }
-                };
+            }
+
+            if (!chosenBoardId) {
+                console.warn('MAXLOW: No separate second camera found');
+                showBoardVideo(null);
+                return;
+            }
 
             boardCameraStream = await navigator.mediaDevices.getUserMedia({
-                video: constraints,
+                video: {
+                    deviceId: { exact: chosenBoardId },
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                },
                 audio: false
             });
 
-            if (settings.mode === 'local') showBoardVideo(boardCameraStream);
-            console.log('MAXLOW: BOARD CAMERA READY');
+            // Always show our second camera locally when it starts.
+            // Online turn switching can replace it with the opponent's second
+            // stream later, but it no longer waits for React state to appear.
+            showBoardVideo(boardCameraStream);
+
+            populateCameraList();
+            console.log('MAXLOW: SECOND / OCHE CAMERA READY', chosenBoardId);
         } catch (error) {
-            console.error('MAXLOW: Board camera error', error);
+            console.error('MAXLOW: Second camera error', error);
             boardCameraStream = null;
             showBoardVideo(null);
+
+            // Keep the selected second-camera device ID. A normal OFF/ON cycle
+            // should reacquire the same physical camera without changing PIN or identity.
         }
     }
 
@@ -1188,99 +1240,65 @@ const CAMERA_ID = 'maxlow-live-player-cam';
 
     function createToolbarControls() {
 
-        if (
-            document.getElementById(BUTTON_ID) &&
-            document.getElementById(SETTINGS_ID)
-        ) {
-            return;
-        }
+        // V2: keep Maxlow controls fixed at the top-right so the
+        // camera overlays can never cover them.
+        let dock = document.getElementById('maxlow-v2-control-dock');
 
+        if (!dock) {
+            dock = document.createElement('div');
+            dock.id = 'maxlow-v2-control-dock';
 
-        const buttons =
-            [...document.querySelectorAll('button')];
-
-
-        const boardButton =
-            buttons.find(button => {
-
-                const text =
-                    button.textContent
-                        .trim()
-                        .toLowerCase();
-
-                return (
-                    text === 'start' ||
-                    text === 'stop'
-                );
+            Object.assign(dock.style, {
+                position: 'fixed',
+                top: '48px',
+                right: '12px',
+                zIndex: '2147483001',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                fontFamily: 'Arial, sans-serif'
             });
 
-
-        if (!boardButton) return;
-
-
-        const toolbar =
-            boardButton.parentElement;
-
-        if (!toolbar) return;
-
-
-        // CAMERA BUTTON
+            document.body.appendChild(dock);
+        }
 
         if (!document.getElementById(BUTTON_ID)) {
-
-            const camButton =
-                document.createElement('button');
+            const camButton = document.createElement('button');
 
             camButton.id = BUTTON_ID;
             camButton.type = 'button';
 
             styleToolbarButton(camButton);
+            camButton.style.marginLeft = '0';
 
-            camButton.addEventListener(
-                'click',
-                toggleCamera
-            );
+            camButton.addEventListener('click', toggleCamera);
 
-            toolbar.appendChild(camButton);
-
+            dock.appendChild(camButton);
             updateCamButton();
         }
 
-
-        // SETTINGS BUTTON
-
         if (!document.getElementById(SETTINGS_ID)) {
-
-            const settingsButton =
-                document.createElement('button');
+            const settingsButton = document.createElement('button');
 
             settingsButton.id = SETTINGS_ID;
             settingsButton.type = 'button';
-
             settingsButton.textContent = '⚙ MAXLOW';
 
             styleToolbarButton(settingsButton);
 
             settingsButton.title = 'Maxlow Camera Settings';
+            settingsButton.style.marginLeft = '0';
             settingsButton.style.padding = '0 10px';
             settingsButton.style.fontSize = '11px';
             settingsButton.style.fontWeight = '900';
             settingsButton.style.whiteSpace = 'nowrap';
             settingsButton.style.minWidth = '78px';
 
+            settingsButton.addEventListener('click', toggleSettingsPanel);
 
-            settingsButton.addEventListener(
-                'click',
-                toggleSettingsPanel
-            );
-
-
-            toolbar.appendChild(
-                settingsButton
-            );
+            dock.appendChild(settingsButton);
         }
     }
-
 
     // ============================================================
     // SETTINGS PANEL
@@ -1628,15 +1646,47 @@ sizeSelect.value =
             boardSelect.style.opacity = settings.boardCameraEnabled ? '1' : '.45';
             saveSettings();
 
-            await startBoardCamera();
+            if (settings.boardCameraEnabled) {
+                // Always acquire a fresh stream when switched back on.
+                await new Promise(resolve => setTimeout(resolve, 120));
+                await startBoardCamera();
+            } else {
+                if (boardCameraStream) {
+                    boardCameraStream.getTracks().forEach(track => track.stop());
+                    boardCameraStream = null;
+                }
+                showBoardVideo(null);
+            }
 
-            // Rebuild WebRTC so the new track layout is negotiated cleanly.
-            if (settings.mode === 'online') {
-                const state = findMatchState();
-                const keepPeerId = onlineCameraPeerId;
-                stopOnlineMode();
-                onlineCameraPeerId = keepPeerId;
-                if (state) startOnlineMode();
+            // IMPORTANT:
+            // Do NOT stop/restart Online Mode here. That closes the signalling
+            // socket and requests a brand-new PIN. The existing PIN/socket must
+            // survive Oche Camera OFF/ON.
+            //
+            // The local second-camera stream is restarted above. If an online
+            // peer connection already exists, replace/add only its video track.
+            if (settings.mode === 'online' && onlinePeerConnection) {
+                try {
+                    const senders = onlinePeerConnection.getSenders();
+                    const boardTrack = boardCameraStream?.getVideoTracks?.()[0] || null;
+
+                    // The main camera is normally the first video sender.
+                    // Treat the second video sender as the Oche/Board camera.
+                    const videoSenders = senders.filter(s => s.track && s.track.kind === 'video');
+                    const secondSender = videoSenders[1] || null;
+
+                    if (settings.boardCameraEnabled && boardTrack) {
+                        if (secondSender) {
+                            await secondSender.replaceTrack(boardTrack);
+                        } else {
+                            onlinePeerConnection.addTrack(boardTrack, boardCameraStream);
+                        }
+                    } else if (secondSender) {
+                        await secondSender.replaceTrack(null);
+                    }
+                } catch (err) {
+                    console.warn('MAXLOW: could not update second online camera track', err);
+                }
             }
         });
 
@@ -1843,15 +1893,24 @@ sizeSelect.value =
         return null;
     }
 
-    function makeIdentity(state) {
+    function getMaxlowReceiverId() {
+        let id = sessionStorage.getItem('maxlow-receiver-id');
+        if (!id) {
+            id = (crypto.randomUUID?.() || Math.random().toString(36).slice(2));
+            sessionStorage.setItem('maxlow-receiver-id', id);
+        }
+        return id;
+    }
+
+    function makeIdentity(state = null) {
         const matchId = getMatchId();
-        if (!matchId || !state) return null;
+        if (!matchId) return null;
+
+        const userPart = state?.userId || getMaxlowReceiverId();
+
         return {
             matchId,
-            // IMPORTANT: both players are in the same match, so matchId alone
-            // gives both browsers the same signalling ID. Include the logged-in
-            // Autodarts user ID so each receiver has a unique endpoint.
-            myId: `autodarts:${matchId}:${state.userId}`,
+            myId: `autodarts:${matchId}:${userPart}`,
             opponentId: onlineCameraPeerId || ''
         };
     }
@@ -2487,66 +2546,64 @@ sizeSelect.value =
     }, true);
 
     function startOnlineMode() {
-        if (settings.mode !== 'online') return;
-
         const currentMatchId = getMatchId();
+        if (!currentMatchId) return;
+
         if (endedMatchId && currentMatchId === endedMatchId) return;
-        if (endedMatchId && currentMatchId && currentMatchId !== endedMatchId) {
-            endedMatchId = '';
-        }
+        if (endedMatchId && currentMatchId !== endedMatchId) endedMatchId = '';
 
         intentionalOnlineStop = false;
-        if (!location.pathname.includes('/matches/')) return;
 
-        const state = findMatchState();
-
-        if (!state) {
-            console.log('MAXLOW: waiting for Autodarts React state');
-            return;
-        }
-
+        const state = settings.mode === 'online' ? findMatchState() : null;
         const nextIdentity = makeIdentity(state);
 
-        if (!nextIdentity) {
-            console.log('MAXLOW: waiting for match identity');
-            showCorrectOnlineVideo(state);
-            return;
-        }
+        if (!nextIdentity) return;
 
-        const changed =
+        const identityChanged =
             !onlineIdentity ||
-            onlineIdentity.myId !== nextIdentity.myId ||
-            onlineIdentity.opponentId !== nextIdentity.opponentId;
+            onlineIdentity.matchId !== nextIdentity.matchId;
 
-        if (changed) {
-            stopOnlineMode();
+        if (identityChanged) {
+            if (onlineSocket) {
+                try {
+                    onlineSocket.onclose = null;
+                    onlineSocket.close();
+                } catch {}
+            }
+            onlineSocket = null;
             onlineIdentity = nextIdentity;
-
-            console.log('======================================');
-            console.log('MAXLOW: AUTOMATIC PLAYER IDENTITY');
-            console.log('MATCH:', onlineIdentity.matchId);
-            console.log('AUTODARTS ROLE:', onlineIdentity.myId);
-            console.log('CAMERA ROLE:', onlineIdentity.opponentId);
-            console.log('ACTIVE PLAYER:', state.activePlayer?.name);
-            console.log('IS MY TURN:', state.isActivePlayer);
-            console.log('======================================');
+            onlinePairingPin = '';
+            updatePinDisplay();
         }
 
-        showCorrectOnlineVideo(state);
+        // Lightweight PIN signalling starts as soon as a match URL exists.
+        // It does not wait for React state and does not perform a page scan.
         connectOnlineSocket();
+
+        // Only online camera mode needs React state for thrower switching.
+        if (settings.mode === 'online' && state) {
+            showCorrectOnlineVideo(state);
+        }
     }
 
     // Autodarts changes React state without reloading the page.
     setInterval(async () => {
-        if (settings.mode !== 'online') return;
-
         const currentMatchId = getMatchId();
 
-        // Leaving the match route also guarantees teardown.
         if (onlineIdentity && !currentMatchId) {
             finishOnlineMatch();
             return;
         }
+
+        if (!currentMatchId) return;
+
+        // Always keep the lightweight PIN service alive in a match.
+        if (!onlineIdentity || !onlineSocket) {
+            startOnlineMode();
+        }
+
+        // Do not run the expensive React scan unless Online Player Cam is selected.
+        if (settings.mode !== 'online') return;
 
         const state = findMatchState();
 
@@ -2556,23 +2613,14 @@ sizeSelect.value =
         }
 
         if (endedMatchId && currentMatchId === endedMatchId) return;
+        if (endedMatchId && currentMatchId !== endedMatchId) endedMatchId = '';
 
-        if (endedMatchId && currentMatchId && currentMatchId !== endedMatchId) {
-            endedMatchId = '';
-        }
-
-        // A new match can restart capture automatically after the previous
-        // match deliberately released both cameras.
-        if (currentMatchId && !cameraStream) {
+        if (!cameraStream) {
             await startCamera();
         }
 
         if (state) {
             showCorrectOnlineVideo(state);
-
-            if (!onlineIdentity || !onlineSocket) {
-                startOnlineMode();
-            }
         }
     }, 500);
 
@@ -3189,8 +3237,8 @@ sizeSelect.value =
         });
 
         Object.assign(button.style, {
-            position:'fixed', top:'12px', right:'12px', zIndex:'2147483000',
-            padding:'8px 12px', border:'1px solid rgba(255,255,255,.25)',
+            position:'fixed', top:'48px', right:'225px', zIndex:'2147483002',
+            height:'30px', padding:'0 12px', border:'1px solid rgba(255,255,255,.25)',
             borderRadius:'6px', background:'rgba(0,0,0,.78)', color:'#fff',
             fontWeight:'800', fontSize:'12px', cursor:'pointer'
         });
@@ -3204,8 +3252,8 @@ sizeSelect.value =
                 textContent:'CHAT'
             });
             Object.assign(chat.style, {
-                position:'fixed', top:'12px', right:'104px', zIndex:'2147483000',
-                padding:'8px 12px', border:'1px solid rgba(255,255,255,.25)',
+                position:'fixed', top:'48px', right:'315px', zIndex:'2147483002',
+                height:'30px', padding:'0 12px', border:'1px solid rgba(255,255,255,.25)',
                 borderRadius:'3px', background:'#1558b0', color:'#fff',
                 fontWeight:'900', fontSize:'12px', cursor:'pointer',
                 boxShadow:'0 0 10px rgba(35,136,255,.25)'
