@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Maxlow Player Cam
 // @namespace    maxlow-designs
-// @version      1.0.50
+// @version      1.0.51
 // @description  Maxlow Player Cam: player cam + board cam + live audio + peer-to-peer chat
 // @match        https://play.autodarts.com/*
 // @updateURL    https://raw.githubusercontent.com/wills1989123-cmyk/maxlow-player-cam-server/main/maxlow-player-cam.user.js
@@ -1330,42 +1330,46 @@ const CAMERA_ID = 'maxlow-live-player-cam';
                 : '📹 CAM OFF';
 
 
-        button.style.borderColor =
-            cameraEnabled
-                ? '#168cff'
-                : '#e53935';
+        // Sky Sports-style state: red when live, dark red when off.
+        button.style.borderColor = cameraEnabled ? '#ff4b55' : '#7f1d1d';
+        button.style.background = cameraEnabled
+            ? 'linear-gradient(180deg,#ed1b2f 0%,#b5091b 100%)'
+            : 'linear-gradient(180deg,#481018 0%,#24080d 100%)';
+        button.style.boxShadow = cameraEnabled
+            ? 'inset 0 1px 0 rgba(255,255,255,.28), 0 0 9px rgba(237,27,47,.28)'
+            : 'inset 0 1px 0 rgba(255,255,255,.10), 0 0 6px rgba(127,29,29,.18)';
     }
 
 
     function styleToolbarButton(button) {
-
         Object.assign(button.style, {
-
             height: '30px',
-
-            padding: '0 10px',
-
-            marginLeft: '5px',
-
-            border: '1px solid #168cff',
-
-            borderRadius: '5px',
-
-            background:
-                'rgba(10,10,15,0.88)',
-
+            padding: '0 12px',
+            marginLeft: '0',
+            border: '1px solid #2d9cff',
+            borderRadius: '3px',
+            background: 'linear-gradient(180deg,#1671d9 0%,#08499d 100%)',
             color: '#fff',
-
-            fontWeight: '700',
-
+            fontFamily: 'Arial, Helvetica, sans-serif',
+            fontWeight: '900',
             fontSize: '11px',
-
+            letterSpacing: '.25px',
+            lineHeight: '28px',
             cursor: 'pointer',
-
-            whiteSpace: 'nowrap'
+            whiteSpace: 'nowrap',
+            outline: 'none',
+            boxShadow: 'inset 0 1px 0 rgba(255,255,255,.28), 0 0 8px rgba(22,140,255,.22)',
+            textShadow: '0 1px 1px rgba(0,0,0,.45)',
+            transition: 'filter .12s ease, transform .12s ease'
         });
-    }
 
+        // Prevent the browser/Tampermonkey yellow focus highlight.
+        button.addEventListener('focus', () => { button.style.outline = 'none'; });
+        button.addEventListener('mouseenter', () => { button.style.filter = 'brightness(1.12)'; });
+        button.addEventListener('mouseleave', () => { button.style.filter = 'brightness(1)'; });
+        button.addEventListener('mousedown', () => { button.style.transform = 'translateY(1px)'; });
+        button.addEventListener('mouseup', () => { button.style.transform = 'translateY(0)'; });
+    }
 
     function createToolbarControls() {
 
@@ -1422,6 +1426,8 @@ const CAMERA_ID = 'maxlow-live-player-cam';
             settingsButton.style.fontWeight = '900';
             settingsButton.style.whiteSpace = 'nowrap';
             settingsButton.style.minWidth = '78px';
+            settingsButton.style.background = 'linear-gradient(180deg,#1671d9 0%,#08499d 100%)';
+            settingsButton.style.borderColor = '#2d9cff';
 
             settingsButton.addEventListener('click', toggleSettingsPanel);
 
@@ -3367,10 +3373,16 @@ sizeSelect.value =
 
         Object.assign(button.style, {
             position:'fixed', top:'48px', right:'225px', zIndex:'2147483002',
-            height:'30px', padding:'0 12px', border:'1px solid rgba(255,255,255,.25)',
-            borderRadius:'6px', background:'rgba(0,0,0,.78)', color:'#fff',
-            fontWeight:'800', fontSize:'12px', cursor:'pointer'
+            height:'30px', minWidth:'84px', padding:'0 12px',
+            border:'1px solid #2d9cff', borderRadius:'3px',
+            background:'linear-gradient(180deg,#1671d9 0%,#08499d 100%)',
+            color:'#fff', fontFamily:'Arial, Helvetica, sans-serif',
+            fontWeight:'900', fontSize:'11px', letterSpacing:'.25px',
+            cursor:'pointer', outline:'none',
+            boxShadow:'inset 0 1px 0 rgba(255,255,255,.28), 0 0 8px rgba(22,140,255,.22)',
+            textShadow:'0 1px 1px rgba(0,0,0,.45)'
         });
+        button.onfocus = () => { button.style.outline = 'none'; };
 
         button.onclick = openSender;
         document.body.append(button);
@@ -3382,11 +3394,16 @@ sizeSelect.value =
             });
             Object.assign(chat.style, {
                 position:'fixed', top:'48px', right:'315px', zIndex:'2147483002',
-                height:'30px', padding:'0 12px', border:'1px solid rgba(255,255,255,.25)',
-                borderRadius:'3px', background:'#1558b0', color:'#fff',
-                fontWeight:'900', fontSize:'12px', cursor:'pointer',
-                boxShadow:'0 0 10px rgba(35,136,255,.25)'
+                height:'30px', minWidth:'72px', padding:'0 12px',
+                border:'1px solid #ff4b55', borderRadius:'3px',
+                background:'linear-gradient(180deg,#ed1b2f 0%,#b5091b 100%)',
+                color:'#fff', fontFamily:'Arial, Helvetica, sans-serif',
+                fontWeight:'900', fontSize:'11px', letterSpacing:'.25px',
+                cursor:'pointer', outline:'none',
+                boxShadow:'inset 0 1px 0 rgba(255,255,255,.28), 0 0 8px rgba(237,27,47,.22)',
+                textShadow:'0 1px 1px rgba(0,0,0,.45)'
             });
+            chat.onfocus = () => { chat.style.outline = 'none'; };
             chat.onclick = () => {
                 if (typeof window.maxlowOpenChat === 'function') window.maxlowOpenChat();
             };
