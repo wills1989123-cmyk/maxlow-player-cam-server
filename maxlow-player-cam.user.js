@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Maxlow Player Cam
 // @namespace    maxlow-designs
-// @version      1.0.49
+// @version      1.0.50
 // @description  Maxlow Player Cam: player cam + board cam + live audio + peer-to-peer chat
 // @match        https://play.autodarts.com/*
 // @updateURL    https://raw.githubusercontent.com/wills1989123-cmyk/maxlow-player-cam-server/main/maxlow-player-cam.user.js
@@ -3460,6 +3460,30 @@ sizeSelect.value =
                     pointer-events: none !important;
                     z-index: 40 !important;
                 }
+                /* Alignment correction ONLY for Samurai Q.
+                   Target/BULL'S/other boards stay at the existing 1.04 scale. */
+                #maxlow-board-skin-image[data-maxlow-skin-name="SAMURAI Q"] {
+                    transform: scale(0.99) !important;
+                }
+                /* Hide the native board/camera area only during initial startup,
+                   so Autodarts cannot visibly flash Camera 1/2/3 before settling. */
+                html.maxlow-board-starting div.relative.w-full.h-full.rounded-full.overflow-hidden[role="img"][aria-label="Dartboard"] {
+                    visibility: hidden !important;
+                }
+
+                /* Transparent Maxlow click-catcher positioned over the native
+                   Tools camera button. This prevents alternate clicks being lost
+                   when React recreates the native button. */
+                #maxlow-board-button-catcher {
+                    position: fixed !important;
+                    z-index: 2147483646 !important;
+                    opacity: 0 !important;
+                    padding: 0 !important;
+                    margin: 0 !important;
+                    border: 0 !important;
+                    background: transparent !important;
+                    cursor: pointer !important;
+                }
             `;
             document.documentElement.appendChild(s);
         }
@@ -3530,65 +3554,67 @@ sizeSelect.value =
 
         installCss();
 
-        // v1.0.9: bind DIRECTLY to the actual Tools button.
-        // There is no document-wide camera click listener anymore, so a dart throw
-        // or React event elsewhere on the page cannot advance the board skin.
-        function isExactToolsCameraButton(button) {
-            if (!button || !(button instanceof HTMLButtonElement)) return false;
-            if (isMaxlowControl(button)) return false;
-            return !!button.querySelector(
-                'svg[data-icon="camera"], svg.fa-camera, .fa-camera, [data-icon="camera"]'
-            );
+        // Stable selector: place an invisible Maxlow control directly over
+        // the native Tools camera button. The overlay itself is never recreated
+        // by Autodarts, so every physical press advances exactly one board.
+        function findNativeToolsCameraButton() {
+            return [...document.querySelectorAll('button')].find(btn => {
+                if (isMaxlowControl(btn)) return false;
+                if (btn.id === 'maxlow-board-button-catcher') return false;
+                return !!btn.querySelector(
+                    'svg[data-icon="camera"], svg.fa-camera, .fa-camera, [data-icon="camera"]'
+                );
+            }) || null;
         }
 
-        // Persistent capture handler: Autodarts never receives this camera-button click.
-        // The selected board is derived from the skin currently on screen, so a React
-        // toolbar rebuild cannot consume a click or desynchronise the four-board cycle.
-        document.addEventListener('click', event => {
-            if (!event.isTrusted) return;
-            const button = event.composedPath().find(
-                node => node instanceof HTMLButtonElement && isExactToolsCameraButton(node)
-            );
-            if (!button) return;
+        function ensureBoardButtonCatcher() {
+            let catcher = document.getElementById('maxlow-board-button-catcher');
+            if (!catcher) {
+                catcher = document.createElement('button');
+                catcher.id = 'maxlow-board-button-catcher';
+                catcher.type = 'button';
+                catcher.setAttribute('aria-label', 'Change Maxlow dartboard');
+                document.body.appendChild(catcher);
 
-            event.preventDefault();
-            event.stopPropagation();
-            event.stopImmediatePropagation();
+                catcher.addEventListener('click', event => {
+                    event.preventDefault();
+                    event.stopPropagation();
 
-            // The camera click is now fully intercepted, so use one simple,
-            // persistent four-position counter. Do not infer state from the DOM.
-            const index = press;
-            press = (press + 1) % SKINS.length;
+                    const index = press;
+                    press = (press + 1) % 4;
 
-            applySkin(index);
-            showBadge(SKINS[index].name);
-            button.title = `Maxlow board: ${SKINS[index].name}`;
-            console.log('MAXLOW board selector:', index, SKINS[index].name);
-        }, true);
+                    applySkin(index);
+                    showBadge(SKINS[index].name);
+                    catcher.title = `Maxlow board: ${SKINS[index].name}`;
+                    console.log('MAXLOW STABLE BOARD:', index + 1, SKINS[index].name);
+                });
+            }
 
-        function bindExactToolsBoardButton() {
-            const button = [...document.querySelectorAll('button')].find(isExactToolsCameraButton);
-            if (button) button.dataset.maxlowExactBoardBound = '1';
+            const nativeButton = findNativeToolsCameraButton();
+            if (!nativeButton) {
+                catcher.style.display = 'none';
+                return;
+            }
+
+            const r = nativeButton.getBoundingClientRect();
+            catcher.style.display = 'block';
+            catcher.style.left = `${r.left}px`;
+            catcher.style.top = `${r.top}px`;
+            catcher.style.width = `${r.width}px`;
+            catcher.style.height = `${r.height}px`;
         }
 
-        // V2 can recreate its toolbar during navigation. Rebind only when needed.
-        const maxlowExactButtonObserver = new MutationObserver(() => {
-            if (bindExactToolsBoardButton.queued) return;
-            bindExactToolsBoardButton.queued = true;
-            requestAnimationFrame(() => {
-                bindExactToolsBoardButton.queued = false;
-                bindExactToolsBoardButton();
-            });
-        });
+        // Cover startup while Autodarts briefly initialises its native camera modes.
+        document.documentElement.classList.add('maxlow-board-starting');
+        setTimeout(() => {
+            document.documentElement.classList.remove('maxlow-board-starting');
+        }, 3000);
 
-        maxlowExactButtonObserver.observe(document.documentElement, {
-            childList: true,
-            subtree: true
-        });
+        // Keep the transparent selector aligned with the native camera button.
+        ensureBoardButtonCatcher();
+        setInterval(ensureBoardButtonCatcher, 250);
 
-        setTimeout(bindExactToolsBoardButton, 800);
-
-        console.log('MAXLOW v1.0.10: native Board lock + Maxlow selector ready');
+        console.log('MAXLOW: stable four-board selector ready');
     })();
 
 
